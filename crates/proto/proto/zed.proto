@@ -488,7 +488,9 @@ message Envelope {
     GetDocumentLinks get_document_links = 453;
     GetDocumentLinksResponse get_document_links_response = 454;
     ResolveDocumentLink resolve_document_link = 455;
-    ResolveDocumentLinkResponse resolve_document_link_response = 456; // current max
+    ResolveDocumentLinkResponse resolve_document_link_response = 456;
+    GetListeningPorts get_listening_ports = 457;
+    GetListeningPortsResponse get_listening_ports_response = 458; // current max
   }
 
   reserved 87 to 88;
@@ -525,6 +527,22 @@ message Hello {
 message Ping {}
 
 message Ack {}
+
+message GetListeningPorts {
+  uint64 project_id = 1;
+}
+
+message GetListeningPortsResponse {
+  repeated ListeningPort ports = 1;
+}
+
+message ListeningPort {
+  uint32 port = 1;
+  string address = 2;
+  optional uint32 pid = 3;
+  optional string process_name = 4;
+  bool ipv6 = 5;
+}
 
 message Error {
   string message = 1;

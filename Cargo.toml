@@ -158,6 +158,7 @@ members = [
     "crates/project_panel",
     "crates/project_symbols",
     "crates/prompt_store",
+    "crates/ports_panel",
     "crates/proto",
     "crates/recent_projects",
     "crates/refineable",
@@ -415,6 +416,7 @@ settings_profile_selector = { path = "crates/settings_profile_selector" }
 project = { path = "crates/project" }
 project_panel = { path = "crates/project_panel" }
 project_symbols = { path = "crates/project_symbols" }
+ports_panel = { path = "crates/ports_panel" }
 prompt_store = { path = "crates/prompt_store" }
 proto = { path = "crates/proto" }
 recent_projects = { path = "crates/recent_projects" }

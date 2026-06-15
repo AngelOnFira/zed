@@ -716,6 +716,17 @@ pub struct ProjectPanelAutoOpenSettings {
     pub on_drop: Option<bool>,
 }
 
+/// Settings for the ports panel, which manages remote port forwarding.
+#[with_fallible_options]
+#[derive(Clone, PartialEq, Default, Serialize, Deserialize, JsonSchema, MergeFrom, Debug)]
+pub struct PortsPanelSettingsContent {
+    /// Whether to automatically forward remote listening ports as they are
+    /// detected on the remote host.
+    ///
+    /// Default: false
+    pub auto_forward: Option<bool>,
+}
+
 #[with_fallible_options]
 #[derive(Clone, PartialEq, Default, Serialize, Deserialize, JsonSchema, MergeFrom, Debug)]
 pub struct ProjectPanelSettingsContent {

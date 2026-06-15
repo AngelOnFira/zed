@@ -208,6 +208,8 @@ pub struct SettingsContent {
 
     pub project_panel: Option<ProjectPanelSettingsContent>,
 
+    pub ports_panel: Option<PortsPanelSettingsContent>,
+
     /// Configuration for the Message Editor
     pub message_editor: Option<MessageEditorSettings>,
 

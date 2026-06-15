@@ -13670,6 +13670,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "ports_panel"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "client",
+ "editor",
+ "futures 0.3.32",
+ "gpui",
+ "log",
+ "project",
+ "recent_projects",
+ "remote",
+ "settings",
+ "ui",
+ "util",
+ "workspace",
+]
+
+[[package]]
 name = "postage"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -22936,6 +22955,7 @@ dependencies = [
  "paths",
  "picker",
  "pkg-config",
+ "ports_panel",
  "pretty_assertions",
  "profiling",
  "project",

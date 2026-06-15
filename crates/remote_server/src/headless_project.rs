@@ -294,6 +294,7 @@ impl HeadlessProject {
         session.add_request_handler(cx.weak_entity(), Self::handle_shutdown_remote_server);
         session.add_request_handler(cx.weak_entity(), Self::handle_ping);
         session.add_request_handler(cx.weak_entity(), Self::handle_get_processes);
+        session.add_request_handler(cx.weak_entity(), Self::handle_get_listening_ports);
         session.add_request_handler(cx.weak_entity(), Self::handle_get_remote_profiling_data);
 
         session.add_entity_request_handler(Self::handle_add_worktree);
@@ -1262,6 +1263,21 @@ impl HeadlessProject {
         Ok(proto::GetProcessesResponse { processes })
     }
 
+    async fn handle_get_listening_ports(
+        _this: Entity<Self>,
+        _envelope: TypedEnvelope<proto::GetListeningPorts>,
+        _cx: AsyncApp,
+    ) -> Result<proto::GetListeningPortsResponse> {
+        // Port detection currently relies on Linux's procfs. On other remote
+        // server platforms we report nothing rather than failing.
+        #[cfg(target_os = "linux")]
+        let ports = listening_ports_linux();
+        #[cfg(not(target_os = "linux"))]
+        let ports = Vec::new();
+
+        Ok(proto::GetListeningPortsResponse { ports })
+    }
+
     async fn handle_get_remote_profiling_data(
         this: Entity<Self>,
         envelope: TypedEnvelope<proto::GetRemoteProfilingData>,
@@ -1365,4 +1381,203 @@ fn find_venv_python(working_directory: &str) -> Option<std::path::PathBuf> {
         }
     }
     None
+}
+
+/// One listening TCP socket parsed from `/proc/net/tcp` or `/proc/net/tcp6`.
+#[cfg(any(target_os = "linux", test))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ListeningSocket {
+    port: u16,
+    address: String,
+    inode: u64,
+    ipv6: bool,
+}
+
+/// Parses `/proc/net/tcp{,6}` contents and returns sockets in the LISTEN state.
+/// Pure (no I/O) so it can be unit-tested on any platform.
+#[cfg(any(target_os = "linux", test))]
+fn parse_proc_net_tcp(contents: &str, ipv6: bool) -> Vec<ListeningSocket> {
+    // The `st` column is the TCP state; `0A` is TCP_LISTEN.
+    const TCP_LISTEN: &str = "0A";
+    let mut sockets = Vec::new();
+    for line in contents.lines().skip(1) {
+        // Columns: sl local_address rem_address st tx:rx tr:tm retrnsmt uid timeout inode ...
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() < 10 || fields[3] != TCP_LISTEN {
+            continue;
+        }
+        let Some((address_hex, port_hex)) = fields[1].split_once(':') else {
+            continue;
+        };
+        let Ok(port) = u16::from_str_radix(port_hex, 16) else {
+            continue;
+        };
+        let Some(address) = parse_hex_address(address_hex, ipv6) else {
+            continue;
+        };
+        let Ok(inode) = fields[9].parse::<u64>() else {
+            continue;
+        };
+        sockets.push(ListeningSocket {
+            port,
+            address,
+            inode,
+            ipv6,
+        });
+    }
+    sockets
+}
+
+/// Decodes a `/proc/net/tcp` hex address. IPv4 is a single little-endian word;
+/// IPv6 is four little-endian words.
+#[cfg(any(target_os = "linux", test))]
+fn parse_hex_address(hex: &str, ipv6: bool) -> Option<String> {
+    if ipv6 {
+        if hex.len() != 32 {
+            return None;
+        }
+        let mut bytes = [0u8; 16];
+        for word in 0..4 {
+            let value = u32::from_str_radix(&hex[word * 8..word * 8 + 8], 16).ok()?;
+            bytes[word * 4..word * 4 + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        Some(std::net::Ipv6Addr::from(bytes).to_string())
+    } else {
+        if hex.len() != 8 {
+            return None;
+        }
+        let value = u32::from_str_radix(hex, 16).ok()?;
+        Some(std::net::Ipv4Addr::from(value.to_le_bytes()).to_string())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn listening_ports_linux() -> Vec<proto::ListeningPort> {
+    use std::collections::HashSet;
+
+    let mut sockets = Vec::new();
+    for (path, ipv6) in [("/proc/net/tcp", false), ("/proc/net/tcp6", true)] {
+        if let Ok(contents) = std::fs::read_to_string(path) {
+            sockets.extend(parse_proc_net_tcp(&contents, ipv6));
+        }
+    }
+
+    let inodes: HashSet<u64> = sockets.iter().map(|socket| socket.inode).collect();
+    let inode_to_process = map_inodes_to_processes(&inodes);
+
+    let mut seen_ports = HashSet::new();
+    let mut ports = Vec::new();
+    for socket in sockets {
+        if !seen_ports.insert(socket.port) {
+            continue;
+        }
+        let (pid, process_name) = match inode_to_process.get(&socket.inode) {
+            Some((pid, name)) => (Some(*pid), Some(name.clone())),
+            None => (None, None),
+        };
+        ports.push(proto::ListeningPort {
+            port: socket.port as u32,
+            address: socket.address,
+            pid,
+            process_name,
+            ipv6: socket.ipv6,
+        });
+    }
+    ports.sort_by_key(|port| port.port);
+    ports
+}
+
+/// Maps socket inodes to the owning process by scanning `/proc/<pid>/fd`. A
+/// process may not be resolvable without sufficient privileges, in which case
+/// its sockets are simply omitted from the map.
+#[cfg(target_os = "linux")]
+fn map_inodes_to_processes(
+    inodes: &std::collections::HashSet<u64>,
+) -> std::collections::HashMap<u64, (u32, String)> {
+    use std::collections::HashMap;
+
+    let mut map = HashMap::new();
+    if inodes.is_empty() {
+        return map;
+    }
+    let Ok(proc_dir) = std::fs::read_dir("/proc") else {
+        return map;
+    };
+
+    for entry in proc_dir.flatten() {
+        let file_name = entry.file_name();
+        let Some(pid) = file_name.to_str().and_then(|name| name.parse::<u32>().ok()) else {
+            continue;
+        };
+        let Ok(fds) = std::fs::read_dir(entry.path().join("fd")) else {
+            continue;
+        };
+        let mut process_name: Option<String> = None;
+        for fd in fds.flatten() {
+            let Ok(link) = std::fs::read_link(fd.path()) else {
+                continue;
+            };
+            let Some(inode) = link
+                .to_str()
+                .and_then(|link| link.strip_prefix("socket:["))
+                .and_then(|link| link.strip_suffix(']'))
+                .and_then(|inode| inode.parse::<u64>().ok())
+            else {
+                continue;
+            };
+            if !inodes.contains(&inode) {
+                continue;
+            }
+            let name = process_name.get_or_insert_with(|| read_process_name(pid));
+            map.entry(inode).or_insert_with(|| (pid, name.clone()));
+        }
+    }
+    map
+}
+
+#[cfg(target_os = "linux")]
+fn read_process_name(pid: u32) -> String {
+    std::fs::read_to_string(format!("/proc/{pid}/comm"))
+        .map(|name| name.trim().to_string())
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod listening_ports_tests {
+    use super::{ListeningSocket, parse_hex_address, parse_proc_net_tcp};
+
+    #[test]
+    fn test_parse_hex_address_ipv4() {
+        // 0100007F is 127.0.0.1 in little-endian; 00000000 is 0.0.0.0.
+        assert_eq!(parse_hex_address("0100007F", false).as_deref(), Some("127.0.0.1"));
+        assert_eq!(parse_hex_address("00000000", false).as_deref(), Some("0.0.0.0"));
+        assert_eq!(parse_hex_address("zzzz", false), None);
+    }
+
+    #[test]
+    fn test_parse_hex_address_ipv6() {
+        let all_zero = "00000000000000000000000000000000";
+        assert_eq!(parse_hex_address(all_zero, true).as_deref(), Some("::"));
+        let loopback = "00000000000000000000000001000000";
+        assert_eq!(parse_hex_address(loopback, true).as_deref(), Some("::1"));
+    }
+
+    #[test]
+    fn test_parse_proc_net_tcp_listening_only() {
+        let contents = "\
+  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
+   0: 0100007F:1538 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 54321 1 0000000000000000 100 0 0 10 0
+   1: 0100007F:8080 0100007F:E1F2 01 00000000:00000000 00:00000000 00000000  1000        0 99999 1 0000000000000000 20 4 30 10 -1
+";
+        let sockets = parse_proc_net_tcp(contents, false);
+        assert_eq!(
+            sockets,
+            vec![ListeningSocket {
+                port: 5432,
+                address: "127.0.0.1".to_string(),
+                inode: 54321,
+                ipv6: false,
+            }]
+        );
+    }
 }
