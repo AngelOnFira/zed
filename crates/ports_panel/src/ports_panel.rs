@@ -674,13 +674,14 @@ fn parse_port(text: &str) -> Option<u16> {
 }
 
 pub struct PortsPanel {
+    project: Entity<Project>,
     manager: Option<Entity<ForwardManager>>,
     focus_handle: FocusHandle,
     local_port_editor: Entity<Editor>,
     remote_host_editor: Entity<Editor>,
     remote_port_editor: Entity<Editor>,
     position: DockPosition,
-    _manager_subscription: Option<Subscription>,
+    _subscriptions: Vec<Subscription>,
 }
 
 impl PortsPanel {
@@ -701,10 +702,11 @@ impl PortsPanel {
         let project = workspace.project().clone();
         cx.new(|cx| {
             let focus_handle = cx.focus_handle();
-            let manager = Self::create_manager(&project, cx);
-            let _manager_subscription = manager
-                .as_ref()
-                .map(|manager| cx.observe(manager, |_, _, cx| cx.notify()));
+
+            // The project may not have its remote connection attached yet when
+            // the panel is first created, so re-check whenever the project changes.
+            let subscriptions =
+                vec![cx.observe(&project, |this: &mut Self, _, cx| this.ensure_manager(cx))];
 
             let local_port_editor = cx.new(|cx| {
                 let mut editor = Editor::single_line(window, cx);
@@ -722,30 +724,45 @@ impl PortsPanel {
                 editor
             });
 
-            Self {
-                manager,
+            let mut this = Self {
+                project,
+                manager: None,
                 focus_handle,
                 local_port_editor,
                 remote_host_editor,
                 remote_port_editor,
                 position: DockPosition::Bottom,
-                _manager_subscription,
-            }
+                _subscriptions: subscriptions,
+            };
+            this.ensure_manager(cx);
+            log::info!(
+                "ports_panel: panel created (has_remote_client={}, manager_active={})",
+                this.project.read(cx).remote_client().is_some(),
+                this.manager.is_some(),
+            );
+            this
         })
     }
 
-    /// Creates a forward manager when the project is an SSH remote. Local
-    /// projects have no remote client, and WSL/Docker remotes that share the
-    /// host network interface don't need forwarding.
-    fn create_manager(
-        project: &Entity<Project>,
-        cx: &mut Context<Self>,
-    ) -> Option<Entity<ForwardManager>> {
-        let remote_client = project.read(cx).remote_client()?;
-        if remote_client.read(cx).shares_network_interface() {
-            return None;
+    /// Creates the forward manager once the project has an SSH remote connection.
+    /// Local projects have no remote client, and WSL/Docker remotes that share
+    /// the host network interface don't need forwarding.
+    fn ensure_manager(&mut self, cx: &mut Context<Self>) {
+        if self.manager.is_some() {
+            return;
         }
-        Some(cx.new(|cx| ForwardManager::new(remote_client, cx)))
+        let Some(remote_client) = self.project.read(cx).remote_client() else {
+            return;
+        };
+        if remote_client.read(cx).shares_network_interface() {
+            return;
+        }
+        log::info!("ports_panel: creating forward manager for remote project");
+        let manager = cx.new(|cx| ForwardManager::new(remote_client, cx));
+        self._subscriptions
+            .push(cx.observe(&manager, |_, _, cx| cx.notify()));
+        self.manager = Some(manager);
+        cx.notify();
     }
 
     fn add_from_form(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1017,7 +1034,7 @@ impl Panel for PortsPanel {
     }
 
     fn icon(&self, _window: &Window, _cx: &App) -> Option<IconName> {
-        self.manager.is_some().then_some(IconName::Server)
+        Some(IconName::Server)
     }
 
     fn icon_tooltip(&self, _window: &Window, _cx: &App) -> Option<&'static str> {
@@ -1030,10 +1047,6 @@ impl Panel for PortsPanel {
 
     fn activation_priority(&self) -> u32 {
         9
-    }
-
-    fn enabled(&self, _cx: &App) -> bool {
-        self.manager.is_some()
     }
 
     fn set_active(&mut self, active: bool, _window: &mut Window, cx: &mut Context<Self>) {
