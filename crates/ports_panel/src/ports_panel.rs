@@ -17,7 +17,7 @@ use editor::Editor;
 use futures::{AsyncBufReadExt as _, StreamExt as _, io::BufReader};
 use gpui::{
     AnyElement, App, AsyncWindowContext, ClipboardItem, Entity, EventEmitter, FocusHandle,
-    Focusable, Subscription, Task, WeakEntity, Window, actions,
+    Focusable, ScrollHandle, Subscription, Task, WeakEntity, Window, actions,
 };
 use project::Project;
 use recent_projects::RemoteSettings;
@@ -27,7 +27,7 @@ use remote::{
 use settings::{RegisterSetting, Settings as _, SettingsContent, SettingsStore};
 use std::collections::HashSet;
 use std::time::Duration;
-use ui::{ListItem, Tooltip, prelude::*};
+use ui::{ListItem, Tooltip, WithScrollbar, prelude::*};
 use util::ResultExt as _;
 use util::command::{Child, Stdio, new_command};
 use workspace::{
@@ -293,9 +293,10 @@ impl ForwardManager {
         cx.notify();
     }
 
-    /// Forwards a detected remote port. Prefers binding the same local port, but
-    /// falls back to an automatically-allocated one if it's already in use.
-    pub fn forward_detected(&mut self, remote_port: u16, cx: &mut Context<Self>) {
+    /// Forwards `remote_host:remote_port` to the local machine. Prefers binding
+    /// the same local port, but falls back to an automatically-allocated one if
+    /// it's already in use.
+    pub fn forward_to(&mut self, remote_host: String, remote_port: u16, cx: &mut Context<Self>) {
         let local_port = if std::net::TcpListener::bind(("127.0.0.1", remote_port)).is_ok() {
             remote_port
         } else {
@@ -304,12 +305,17 @@ impl ForwardManager {
         self.add_forward(
             local_port,
             "127.0.0.1".to_string(),
-            "localhost".to_string(),
+            remote_host,
             remote_port,
             ForwardSource::Manual,
             cx,
         )
         .log_err();
+    }
+
+    /// Forwards a detected remote port (always on the remote's `localhost`).
+    pub fn forward_detected(&mut self, remote_port: u16, cx: &mut Context<Self>) {
+        self.forward_to("localhost".to_string(), remote_port, cx);
     }
 
     fn detected_rows(&self) -> Vec<DetectedRow> {
@@ -318,7 +324,8 @@ impl ForwardManager {
             .iter()
             .map(|forward| forward.remote_port)
             .collect();
-        self.detected
+        let mut rows: Vec<DetectedRow> = self
+            .detected
             .iter()
             .filter(|port| !forwarded.contains(&(port.port as u16)))
             .map(|port| DetectedRow {
@@ -326,7 +333,15 @@ impl ForwardManager {
                 address: port.address.clone(),
                 process_name: port.process_name.clone(),
             })
-            .collect()
+            .collect();
+        // Surface named services first (easier to recognize), then sort by port.
+        rows.sort_by(|a, b| {
+            a.process_name
+                .is_none()
+                .cmp(&b.process_name.is_none())
+                .then(a.port.cmp(&b.port))
+        });
+        rows
     }
 
     /// Records the connect-time static forwards (applied as `-L` on the SSH
@@ -673,13 +688,35 @@ fn parse_port(text: &str) -> Option<u16> {
     text.parse::<u16>().ok()
 }
 
+/// Parses the quick-add field into `(remote_host, remote_port)`. Accepts a bare
+/// port (`"3000"` → `localhost`) or `"host:port"`. Splits on the last colon and
+/// strips brackets so IPv6 literals like `[::1]:3000` work.
+fn parse_quick_add(text: &str) -> Option<(String, u16)> {
+    let text = text.trim();
+    if text.is_empty() {
+        return None;
+    }
+    match text.rsplit_once(':') {
+        None => parse_port(text).map(|port| ("localhost".to_string(), port)),
+        Some((host, port)) => {
+            let port = parse_port(port)?;
+            let host = host.trim().trim_start_matches('[').trim_end_matches(']');
+            let host = if host.is_empty() {
+                "localhost".to_string()
+            } else {
+                host.to_string()
+            };
+            Some((host, port))
+        }
+    }
+}
+
 pub struct PortsPanel {
     project: Entity<Project>,
     manager: Option<Entity<ForwardManager>>,
     focus_handle: FocusHandle,
-    local_port_editor: Entity<Editor>,
-    remote_host_editor: Entity<Editor>,
-    remote_port_editor: Entity<Editor>,
+    quick_add_editor: Entity<Editor>,
+    scroll_handle: ScrollHandle,
     position: DockPosition,
     _subscriptions: Vec<Subscription>,
 }
@@ -708,19 +745,9 @@ impl PortsPanel {
             let subscriptions =
                 vec![cx.observe(&project, |this: &mut Self, _, cx| this.ensure_manager(cx))];
 
-            let local_port_editor = cx.new(|cx| {
+            let quick_add_editor = cx.new(|cx| {
                 let mut editor = Editor::single_line(window, cx);
-                editor.set_placeholder_text("Local port (auto)", window, cx);
-                editor
-            });
-            let remote_host_editor = cx.new(|cx| {
-                let mut editor = Editor::single_line(window, cx);
-                editor.set_placeholder_text("Remote host (localhost)", window, cx);
-                editor
-            });
-            let remote_port_editor = cx.new(|cx| {
-                let mut editor = Editor::single_line(window, cx);
-                editor.set_placeholder_text("Remote port", window, cx);
+                editor.set_placeholder_text("Forward a port (e.g. 3000 or host:3000)", window, cx);
                 editor
             });
 
@@ -728,9 +755,8 @@ impl PortsPanel {
                 project,
                 manager: None,
                 focus_handle,
-                local_port_editor,
-                remote_host_editor,
-                remote_port_editor,
+                quick_add_editor,
+                scroll_handle: ScrollHandle::new(),
                 position: DockPosition::Bottom,
                 _subscriptions: subscriptions,
             };
@@ -765,69 +791,56 @@ impl PortsPanel {
         cx.notify();
     }
 
-    fn add_from_form(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// Forwards the port typed into the quick-add field. Accepts a bare port
+    /// (`3000`, assuming `localhost`) or `host:port`, and binds the same local
+    /// port (falling back to an auto-allocated one if it's taken).
+    fn confirm_quick_add(&mut self, _: &menu::Confirm, window: &mut Window, cx: &mut Context<Self>) {
         let Some(manager) = self.manager.clone() else {
             return;
         };
-        let Some(remote_port) = parse_port(&self.remote_port_editor.read(cx).text(cx)) else {
+        let Some((remote_host, remote_port)) =
+            parse_quick_add(&self.quick_add_editor.read(cx).text(cx))
+        else {
             return;
-        };
-        let local_port = parse_port(&self.local_port_editor.read(cx).text(cx)).unwrap_or(0);
-        let remote_host = {
-            let host = self.remote_host_editor.read(cx).text(cx).trim().to_string();
-            if host.is_empty() {
-                "localhost".to_string()
-            } else {
-                host
-            }
         };
 
         manager.update(cx, |manager, cx| {
-            manager
-                .add_forward(
-                    local_port,
-                    "127.0.0.1".to_string(),
-                    remote_host,
-                    remote_port,
-                    ForwardSource::Manual,
-                    cx,
-                )
-                .log_err();
+            manager.forward_to(remote_host, remote_port, cx);
         });
 
-        self.local_port_editor
-            .update(cx, |editor, cx| editor.set_text("", window, cx));
-        self.remote_port_editor
+        self.quick_add_editor
             .update(cx, |editor, cx| editor.set_text("", window, cx));
         cx.notify();
     }
 
-    fn render_input(&self, editor: Entity<Editor>, width: Pixels, cx: &Context<Self>) -> Div {
-        div()
-            .w(width)
-            .px_1p5()
-            .py_0p5()
-            .border_1()
-            .border_color(cx.theme().colors().border)
-            .rounded_md()
-            .child(editor)
-    }
-
-    fn render_add_form(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_quick_add(&self, cx: &mut Context<Self>) -> impl IntoElement {
         h_flex()
             .gap_1p5()
             .p_2()
             .border_b_1()
             .border_color(cx.theme().colors().border)
-            .child(self.render_input(self.local_port_editor.clone(), px(96.), cx))
-            .child(Label::new("→").color(Color::Muted))
-            .child(self.render_input(self.remote_host_editor.clone(), px(160.), cx))
-            .child(Label::new(":").color(Color::Muted))
-            .child(self.render_input(self.remote_port_editor.clone(), px(96.), cx))
             .child(
-                Button::new("add-forward", "Forward").on_click(
-                    cx.listener(|this, _, window, cx| this.add_from_form(window, cx)),
-                ),
+                Icon::new(IconName::Plus)
+                    .size(IconSize::Small)
+                    .color(Color::Muted),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .px_1p5()
+                    .py_0p5()
+                    .border_1()
+                    .border_color(cx.theme().colors().border)
+                    .rounded_md()
+                    .child(self.quick_add_editor.clone()),
+            )
+            .child(
+                IconButton::new("quick-add-forward", IconName::Return)
+                    .icon_size(IconSize::Small)
+                    .tooltip(Tooltip::text("Forward port"))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.confirm_quick_add(&menu::Confirm, window, cx)
+                    })),
             )
     }
 
@@ -914,17 +927,30 @@ impl PortsPanel {
 
     fn render_detected_row(&self, row: DetectedRow, cx: &mut Context<Self>) -> impl IntoElement {
         let port = row.port;
-        let label = match row.process_name.as_deref() {
-            Some(name) if !name.is_empty() => format!("{name} — {}:{}", row.address, port),
-            _ => format!("{}:{}", row.address, port),
+        let address = format!("{}:{}", row.address, port);
+        let primary = match row.process_name.as_deref() {
+            Some(name) if !name.is_empty() => name.to_string(),
+            _ => address.clone(),
         };
+        let secondary = (primary != address).then_some(address);
+
         ListItem::new(("detected", port as u64))
             .start_slot(
                 Icon::new(IconName::Server)
                     .color(Color::Muted)
                     .size(IconSize::Small),
             )
-            .child(Label::new(label).color(Color::Muted))
+            .child(
+                v_flex()
+                    .child(Label::new(primary))
+                    .when_some(secondary, |this, address| {
+                        this.child(
+                            Label::new(address)
+                                .size(LabelSize::Small)
+                                .color(Color::Muted),
+                        )
+                    }),
+            )
             .end_slot(
                 IconButton::new(("forward", port as u64), IconName::Plus)
                     .icon_size(IconSize::Small)
@@ -937,52 +963,68 @@ impl PortsPanel {
             )
     }
 
-    fn render_body(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_section_header(&self, title: &'static str) -> impl IntoElement {
+        div().px_2().pt_2().child(
+            Label::new(title)
+                .size(LabelSize::Small)
+                .color(Color::Muted),
+        )
+    }
+
+    fn render_empty_state(&self, message: &'static str) -> AnyElement {
+        v_flex()
+            .size_full()
+            .items_center()
+            .justify_center()
+            .gap_2()
+            .p_4()
+            .child(
+                Icon::new(IconName::Server)
+                    .size(IconSize::Medium)
+                    .color(Color::Muted),
+            )
+            .child(Label::new(message).color(Color::Muted))
+            .into_any_element()
+    }
+
+    fn render_body(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let Some(manager) = self.manager.clone() else {
-            return v_flex()
-                .p_4()
-                .child(
-                    Label::new("Port forwarding is available for SSH remote projects.")
-                        .color(Color::Muted),
-                )
-                .into_any_element();
+            return self
+                .render_empty_state("Port forwarding is available for SSH remote projects.");
         };
 
         let forwards = manager.read(cx).display_rows();
         let detected = manager.read(cx).detected_rows();
 
-        let mut container = v_flex().size_full().gap_1().p_1();
+        if forwards.is_empty() && detected.is_empty() {
+            return self.render_empty_state("No forwarded or detected ports yet.");
+        }
 
-        if forwards.is_empty() {
-            container = container.child(
-                div()
-                    .p_2()
-                    .child(Label::new("No forwarded ports.").color(Color::Muted)),
-            );
-        } else {
-            let mut items = Vec::with_capacity(forwards.len());
+        let mut container = v_flex()
+            .id("ports-body")
+            .size_full()
+            .gap_1()
+            .p_1()
+            .overflow_y_scroll()
+            .track_scroll(&self.scroll_handle);
+
+        if !forwards.is_empty() {
+            container = container.child(self.render_section_header("Forwarded ports"));
             for row in forwards {
-                items.push(self.render_forward_row(row, cx).into_any_element());
+                container = container.child(self.render_forward_row(row, cx).into_any_element());
             }
-            container = container.children(items);
         }
 
         if !detected.is_empty() {
-            container = container.child(
-                div().px_2().pt_2().child(
-                    Label::new("Detected ports")
-                        .size(LabelSize::Small)
-                        .color(Color::Muted),
-                ),
-            );
-            let mut items = Vec::with_capacity(detected.len());
+            container = container.child(self.render_section_header("Detected ports"));
             for row in detected {
-                items.push(self.render_detected_row(row, cx).into_any_element());
+                container = container.child(self.render_detected_row(row, cx).into_any_element());
             }
-            container = container.children(items);
         }
 
-        container.into_any_element()
+        container
+            .vertical_scrollbar_for(&self.scroll_handle, window, cx)
+            .into_any_element()
     }
 }
 
@@ -995,15 +1037,16 @@ impl Focusable for PortsPanel {
 impl EventEmitter<PanelEvent> for PortsPanel {}
 
 impl Render for PortsPanel {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         v_flex()
             .size_full()
             .key_context("PortsPanel")
             .track_focus(&self.focus_handle)
+            .on_action(cx.listener(Self::confirm_quick_add))
             .when(self.manager.is_some(), |this| {
-                this.child(self.render_add_form(cx))
+                this.child(self.render_quick_add(cx))
             })
-            .child(self.render_body(cx))
+            .child(self.render_body(window, cx))
     }
 }
 
@@ -1068,6 +1111,30 @@ mod tests {
         assert_eq!(parse_port("70000"), None);
         assert_eq!(parse_port(" 8080 "), Some(8080));
         assert_eq!(parse_port("0"), Some(0));
+    }
+
+    #[test]
+    fn test_parse_quick_add() {
+        assert_eq!(parse_quick_add(""), None);
+        assert_eq!(parse_quick_add("not-a-port"), None);
+        assert_eq!(
+            parse_quick_add("3000"),
+            Some(("localhost".to_string(), 3000))
+        );
+        assert_eq!(
+            parse_quick_add(" 8080 "),
+            Some(("localhost".to_string(), 8080))
+        );
+        assert_eq!(
+            parse_quick_add("db.internal:5432"),
+            Some(("db.internal".to_string(), 5432))
+        );
+        assert_eq!(parse_quick_add("[::1]:3000"), Some(("::1".to_string(), 3000)));
+        assert_eq!(
+            parse_quick_add(":9000"),
+            Some(("localhost".to_string(), 9000))
+        );
+        assert_eq!(parse_quick_add("host:notaport"), None);
     }
 
     fn key(local_port: u16, remote_port: u16) -> ForwardKey {

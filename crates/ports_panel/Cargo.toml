@@ -19,6 +19,7 @@ editor.workspace = true
 futures.workspace = true
 gpui.workspace = true
 log.workspace = true
+menu.workspace = true
 project.workspace = true
 recent_projects.workspace = true
 remote.workspace = true
